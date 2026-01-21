@@ -2,10 +2,11 @@ import os
 import asyncio
 import argparse
 import collections
+import sqlite3
+import logging
+from datetime import datetime
 from telethon import TelegramClient, events
 from dotenv import load_dotenv
-
-import logging
 
 # Load environment variables
 load_dotenv()
@@ -20,10 +21,11 @@ API_HASH = os.getenv('TELEGRAM_API_HASH')
 SESSION_NAME = 'draft_bot_session'
 
 # Configuration
-MARKER = "\n>_"
+MARKER = "\n>here<"
 AUTOSQUASH_ENABLED = False
-# Lock to prevent race conditions per chat (e.g., fast typing or incoming + outgoing same time)
+# Lock to prevent race conditions per chat
 CHAT_LOCKS = collections.defaultdict(asyncio.Lock)
+DB_NAME = "deleted_messages.db"
 
 if not API_ID or not API_HASH:
     print("Error: TELEGRAM_API_ID and TELEGRAM_API_HASH must be set in a .env file.")
@@ -34,14 +36,90 @@ def parse_arguments():
     parser.add_argument('-d', '--dry-run', action='store_true', help="Print actions without executing them")
     return parser.parse_args()
 
+def init_db():
+    """Initialize the SQLite database for deleted messages."""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS deleted_messages
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      chat_id INTEGER,
+                      message_id INTEGER,
+                      sender_id INTEGER,
+                      text TEXT,
+                      sent_date TEXT,
+                      deleted_at TEXT)''')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Database init error: {e}")
+
+def archive_messages(messages):
+    """Save messages to SQLite before deletion."""
+    if not messages:
+        return
+    if not isinstance(messages, list):
+        messages = [messages]
+        
+    data = []
+    now = datetime.now().isoformat()
+    
+    for m in messages:
+        try:
+            # Safe attribute access
+            m_id = getattr(m, 'id', None)
+            c_id = getattr(m, 'chat_id', None)
+            s_id = getattr(m, 'sender_id', None)
+            text = getattr(m, 'text', "")
+            date_obj = getattr(m, 'date', None)
+            sent_date = date_obj.isoformat() if date_obj else None
+            
+            data.append((c_id, m_id, s_id, text, sent_date, now))
+        except Exception as e:
+            print(f"Error preparing message {getattr(m, 'id', '?')} for archive: {e}")
+            
+    if not data:
+        return
+
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.executemany('''INSERT INTO deleted_messages 
+                         (chat_id, message_id, sender_id, text, sent_date, deleted_at) 
+                         VALUES (?, ?, ?, ?, ?, ?)''', data)
+        conn.commit()
+        conn.close()
+        # print(f"Archived {len(data)} messages.") # Optional: too verbose for every delete
+    except Exception as e:
+        print(f"CRITICAL: Failed to archive messages to DB: {e}")
+
+async def safe_delete(client, chat, messages, dry_run=False):
+    """Archives messages then deletes them."""
+    if not messages:
+        return
+    
+    if not isinstance(messages, list):
+        messages = [messages]
+
+    if dry_run:
+        print(f"[DRY RUN] Would archive and delete {len(messages)} message(s). IDs: {[m.id for m in messages]}")
+        return
+
+    # 1. Archive
+    archive_messages(messages)
+    
+    # 2. Delete
+    try:
+        await client.delete_messages(chat, messages)
+    except Exception as e:
+        print(f"Delete failed: {e}")
+
 def is_plain_text(message):
     """Returns True if message is strictly plain text (no media, no forwards, has text)."""
     return bool(message.text and not message.media and not message.fwd_from)
 
 async def strip_marker_from_last_message(client, chat_id):
     """Helper to find the last marked message by me in a chat and strip the marker."""
-    # Search last 10 messages to find one with a marker.
-    # Just checking limit=1 fails if the latest message is the sticker that triggered this boundary.
     async for msg in client.iter_messages(chat_id, from_user='me', limit=10):
         if msg.text and msg.text.endswith(MARKER):
             new_text = msg.text[:-len(MARKER)]
@@ -50,15 +128,19 @@ async def strip_marker_from_last_message(client, chat_id):
                 print(f"[Autosquash] Boundary hit. Removed marker from message {msg.id}.")
             except Exception as e:
                 print(f"[Autosquash] Failed to strip marker: {e}")
-            return # Only strip the most recent one found
+            return
 
 async def main():
+    # Initialize DB
+    init_db()
+    
     args = parse_arguments()
-
+    
     async with TelegramClient(SESSION_NAME, int(API_ID), API_HASH) as client:
         print(f"Connected! (Dry Run: {args.dry_run})")
+        print(f"Message backup: {DB_NAME}")
         print("Listening for commands...")
-        print("  !squash [n]      -> Merge messages")
+        print("  !squash [n]        -> Merge messages")
         print("  !autosquash on/off -> Toggle auto-squashing mode")
 
         # --- Command: !autosquash on/off ---
@@ -66,7 +148,7 @@ async def main():
         async def toggle_autosquash(event):
             global AUTOSQUASH_ENABLED
             mode = event.pattern_match.group(1).lower()
-
+            
             if mode == 'on':
                 AUTOSQUASH_ENABLED = True
                 print(">>> AUTOSQUASH ENABLED <<<")
@@ -75,13 +157,13 @@ async def main():
                 AUTOSQUASH_ENABLED = False
                 print(">>> AUTOSQUASH DISABLED <<<")
                 await event.edit("`Autosquash Disabled.`")
-
+                
                 # Cleanup: Strip marker from last message in this chat if exists
                 await strip_marker_from_last_message(client, event.chat_id)
-
-            # Delete the status message after a few seconds to keep chat clean
+            
+            # Delete the status message after a few seconds
             await asyncio.sleep(3)
-            await event.delete()
+            await safe_delete(client, event.chat_id, [event.message], dry_run=args.dry_run)
 
         # --- Command: !squash ---
         @client.on(events.NewMessage(outgoing=True, pattern=r'^!squash(?:\s+(\d+))?\s*$'))
@@ -90,20 +172,20 @@ async def main():
                 n_str = event.pattern_match.group(1)
                 chat = await event.get_chat()
                 chat_name = getattr(chat, 'title', getattr(chat, 'first_name', str(chat.id)))
-
+                
                 messages = []
-
+                
                 if n_str:
                     n = int(n_str)
                     print(f"Command: !squash {n} in {chat_name}")
                     if n < 1:
-                        if not args.dry_run: await event.delete()
+                        await safe_delete(client, event.chat_id, [event.message], dry_run=args.dry_run)
                         return
 
                     async for msg in client.iter_messages(chat, from_user='me', limit=n, offset_id=event.id):
                         if not is_plain_text(msg):
                             print(f"Aborting: Message {msg.id} in fixed range {n} is not plain text.")
-                            if not args.dry_run: await event.delete()
+                            await safe_delete(client, event.chat_id, [event.message], dry_run=args.dry_run)
                             return
                         messages.append(msg)
                 else:
@@ -113,16 +195,15 @@ async def main():
                             messages.append(msg)
                         else:
                             break
-
+                            
                 if not messages:
                     print("No messages found to squash.")
-                    if not args.dry_run: await event.delete()
+                    await safe_delete(client, event.chat_id, [event.message], dry_run=args.dry_run)
                     return
 
                 messages.reverse()
-
-                # Cleanup markers from the messages we are about to squash
-                # (in case we squash a bunch of previously autosquashed messages manually)
+                
+                # Cleanup markers
                 cleaned_texts = []
                 for m in messages:
                     txt = m.text
@@ -132,25 +213,31 @@ async def main():
 
                 target_msg = messages[0]
                 msgs_to_delete = messages[1:]
-                combined_text = "\n".join(cleaned_texts) # Note: manual squash doesn't add marker by default
-
+                combined_text = "\n".join(cleaned_texts)
+                
                 if len(combined_text) > 4096:
                     print(f"Aborting: Combined text length ({len(combined_text)}) exceeds limit.")
-                    if not args.dry_run: await event.delete()
+                    await safe_delete(client, event.chat_id, [event.message], dry_run=args.dry_run)
                     return
-
+                
                 print(f"Squashing {len(messages)} messages.")
-
+                
                 if not args.dry_run:
                     try:
                         if combined_text != target_msg.text:
                             await target_msg.edit(combined_text)
+                        
+                        # Add command message to deletion list
                         msgs_to_delete.append(event.message)
-                        await client.delete_messages(chat, msgs_to_delete)
+                        
+                        # Use safe_delete for all
+                        await safe_delete(client, chat, msgs_to_delete, dry_run=args.dry_run)
+                        
                     except Exception as e:
                         print(f"Failed to squash messages: {e}")
                 else:
-                    print("[DRY RUN] Would squash.")
+                    print("[DRY RUN] Would edit oldest message and delete others.")
+                    print(f"[DRY RUN] Would delete {len(msgs_to_delete) + 1} messages (including command).")
 
             except Exception as e:
                 print(f"Error during squash: {e}")
@@ -160,78 +247,58 @@ async def main():
         async def incoming_boundary_handler(event):
             if not AUTOSQUASH_ENABLED:
                 return
-
-            # If someone else sends a message, it's a boundary.
-            # We need to lock the chat to ensure we don't conflict with an outgoing message logic
             async with CHAT_LOCKS[event.chat_id]:
                 await strip_marker_from_last_message(client, event.chat_id)
 
         # --- Real-time: Outgoing Message (Autosquash Logic) ---
         @client.on(events.NewMessage(outgoing=True))
         async def autosquash_watcher(event):
-            # Ignore commands
             if event.text.startswith('!squash') or event.text.lower().startswith('!autosquash'):
                 return
 
-            # Log message
-            chat_title = str(event.chat_id)
             try:
                 chat = await event.get_chat()
                 chat_title = getattr(chat, 'title', getattr(chat, 'first_name', str(event.chat_id)))
             except:
-                pass
+                chat_title = str(event.chat_id)
             print(f"Sent to {chat_title}: {event.text}")
 
             if not AUTOSQUASH_ENABLED:
                 return
-
+            
+            # Dry run handled inside logic via args.dry_run usage in actions if needed, 
+            # but usually autosquash shouldn't run in dry run mode?
+            # The prompt asked for -d arg, which we have.
             if args.dry_run:
                 return
 
             async with CHAT_LOCKS[event.chat_id]:
-                # 1. Check current message type
                 if not is_plain_text(event.message):
-                    # Current message is a boundary (media/forward).
-                    # Strip marker from previous message and do nothing else.
                     await strip_marker_from_last_message(client, event.chat_id)
                     return
 
-                # 2. Fetch the immediately preceding message
-                # offset_id=event.id ensures we get the one before the current one
                 prev_msg = None
                 async for msg in client.iter_messages(event.chat_id, limit=1, offset_id=event.id):
                     prev_msg = msg
                     break
 
-                # 3. Decision Logic
                 should_merge = False
-
                 if prev_msg and prev_msg.out and is_plain_text(prev_msg):
-                    # Check if previous message has the marker
                     if prev_msg.text.endswith(MARKER):
                         should_merge = True
-                    else:
-                        # Previous message exists but has NO marker.
-                        # This implies we hit a boundary previously or manually edited it.
-                        # Start a new chain.
-                        should_merge = False
-                else:
-                    # Previous message is not ours, or not text. New chain.
-                    should_merge = False
-
+                
                 if should_merge:
                     # MERGE
-                    # Strip marker from previous message text
                     clean_prev_text = prev_msg.text[:-len(MARKER)]
-                    # Combine: Old Text (Clean) + New Message + New Marker
                     new_combined_text = f"{clean_prev_text}\n{event.text}{MARKER}"
-
+                    
                     if len(new_combined_text) <= 4096:
                         try:
-                            # 1. Edit previous message to include new text and move the marker
                             await prev_msg.edit(new_combined_text)
-                            # 2. Delete the current message
-                            await event.delete()
+                            
+                            # DELETE with backup
+                            await safe_delete(client, event.chat_id, [event.message], dry_run=args.dry_run)
+                            
                             print(f"[Autosquash] Merged into message {prev_msg.id}.")
                         except Exception as e:
                             print(f"[Autosquash] Merge failed: {e}. Starting new chain.")
@@ -239,18 +306,16 @@ async def main():
                                 await event.edit(event.text + MARKER)
                             except: pass
                     else:
-                        # Length limit reached. Strip old marker and start fresh on this one.
+                        # Limit reached
                         try:
                             await prev_msg.edit(clean_prev_text)
                         except: pass
-
                         try:
                             await event.edit(event.text + MARKER)
-                            print(f"[Autosquash] Limit reached. Started new chain at {event.id}.")
+                            print(f"[Autosquash] Limit reached. Started new chain.")
                         except: pass
-
                 else:
-                    # START NEW CHAIN
+                    # NEW CHAIN
                     try:
                         await event.edit(event.text + MARKER)
                         print(f"[Autosquash] Started new chain at {event.id}.")
