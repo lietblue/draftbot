@@ -128,20 +128,78 @@ async def main():
       except Exception:
         pass
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r'^>\s*$'))
+    # --- 1. Typewriter Effect Handler (>! [delay] [cpm] text) ---
+    @client.on(events.NewMessage(outgoing=True, pattern=r'^>!([\s\S]+)$'))
+    async def typewriter_handler(event):
+      try:
+        raw_text = event.pattern_match.group(1).strip()
+        if not raw_text:
+          return
+
+        # Defaults
+        delay = 0.0
+        cpm = 600  # Default speed (Characters Per Minute), ~0.1s per char
+        text_to_type = raw_text
+
+        # Parse parameters: >! <delay> <cpm> <text>
+        # Check if the text starts with "number number "
+        import re
+        # Regex: Start with float/int, space, int, space, then rest
+        match = re.match(r'^(\d+(?:\.\d+)?)\s+(\d+)\s+([\s\S]+)$', raw_text)
+        if match:
+            delay = float(match.group(1))
+            cpm = int(match.group(2))
+            text_to_type = match.group(3)
+
+        # Initial delay
+        if delay > 0:
+            # We can show a cursor or just wait
+            # await event.edit("█") 
+            await asyncio.sleep(delay)
+
+        # Animate typing
+        current_text = ""
+        last_update_time = time.time()
+        
+        # Calculate delay per character
+        # CPM (Characters Per Minute) -> 60 / CPM seconds per char
+        char_delay = 60.0 / cpm if cpm > 0 else 0.05
+
+        for i, char in enumerate(text_to_type):
+          current_text += char
+          
+          # Update throttle to avoid FloodWait (approx every 0.5s is safe)
+          current_time = time.time()
+          
+          # Force update if it's the last character, otherwise throttle
+          is_last = (i == len(text_to_type) - 1)
+          if (current_time - last_update_time > 0.5) or is_last:
+            try:
+              # Show cursor unless it's the last char
+              display_text = current_text + " █" if not is_last else current_text
+              await event.edit(display_text)
+              last_update_time = current_time
+            except Exception:
+              pass
+            
+          await asyncio.sleep(char_delay)
+
+      except Exception as e:
+        print(f"Typewriter error: {e}")
+
+
+    # --- 2. AI Think Handler (> instruction) ---
+    @client.on(events.NewMessage(outgoing=True, pattern=r'^>(?!!)([\s\S]*)$'))
     async def think_handler(event):
       try:
+        user_instruction = event.pattern_match.group(1).strip()
+        
         chat = await event.get_chat()
         chat_title = getattr(chat, 'title', getattr(chat, 'first_name', str(chat.id)))
         print(f"Thinking in {chat_title}...")
 
         # 1. Fetch Context
         history = []
-        # We need to skip the > command itself, so we take limit=21 and skip the first (which is event.message)
-        # Actually, iter_messages includes the current message if offset is not set?
-        # event.message is the one triggering this.
-        # Let's just fetch 21 and filter out the !think command if present, or just take the context.
-
         messages = []
         async for msg in client.iter_messages(chat, limit=21):
           messages.append(msg)
@@ -150,9 +208,6 @@ async def main():
         messages.reverse()
 
         for msg in messages:
-          # Skip the !think command itself from context if we want, or keep it.
-          # Usually better to exclude the trigger command to avoid confusion,
-          # but including it is fine too. Let's exclude the very last message if it is !think.
           if msg.id == event.id:
             continue
 
@@ -171,7 +226,7 @@ async def main():
         context_str = "\n".join(history)
 
         # 2. Prompting
-        prompt = f"""
+        base_prompt = f"""
 You are a silly catgirl lurking in the telegram chat.
 Here is the conversation context (last 20 messages):
 {context_str}
@@ -183,6 +238,11 @@ Choose a language that matches the predominant language of the chat.
 Generate responses that's not repetitive to your previous responses.
 Do not include any prefixes. Just provide the raw text of the response.
 """
+        
+        # Append user instruction if provided
+        final_prompt = base_prompt
+        if user_instruction:
+            final_prompt += f"\n\nAdditional User Instruction:\n{user_instruction}"
 
         # Start spinner
         spinner_task = asyncio.create_task(run_spinner(event))
@@ -199,7 +259,7 @@ Do not include any prefixes. Just provide the raw text of the response.
             try:
               response = litellm.completion(
                 model=LLM_MODEL,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "user", "content": final_prompt}],
                 stream=True,
                 max_tokens=1024
               )
