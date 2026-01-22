@@ -36,7 +36,7 @@ async def main():
         while True:
           await event.edit(frames[i])
           i = (i + 1) % len(frames)
-          await asyncio.sleep(0.5)
+          await asyncio.sleep(0.1)
       except asyncio.CancelledError:
         pass
       except Exception:
@@ -100,27 +100,44 @@ Do not include any prefixes. Just provide the raw text of the response.
         last_update_time = time.time()
 
         try:
-          response = await litellm.acompletion(
-            model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            stream=True
-          )
+          loop = asyncio.get_running_loop()
+          queue: asyncio.Queue = asyncio.Queue()
+
+          def _stream_in_thread():
+            try:
+              response = litellm.completion(
+                model=LLM_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                stream=True,
+              )
+              for chunk in response:
+                asyncio.run_coroutine_threadsafe(queue.put(chunk), loop).result()
+              asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
+            except Exception as e:
+              asyncio.run_coroutine_threadsafe(queue.put(e), loop).result()
+
+          producer_task = asyncio.create_task(asyncio.to_thread(_stream_in_thread))
 
           first_chunk = True
-          async for chunk in response:
-            if first_chunk:
-              spinner_task.cancel()
-              try:
-                await spinner_task
-              except asyncio.CancelledError:
-                pass
-              first_chunk = False
-
+          while True:
+            chunk = await queue.get()
+            if chunk is None:
+              break
+            if isinstance(chunk, Exception):
+              raise chunk
             content = chunk.choices[0].delta.content or ""
             if content:
+              if first_chunk:
+                spinner_task.cancel()
+                try:
+                  await spinner_task
+                except asyncio.CancelledError:
+                  pass
+                first_chunk = False
+
               # Add a tiny delay for each chunk to make it look "natural" or slower
-              await asyncio.sleep(0.3)
               generated_text += content
+              await asyncio.sleep(0.1)
 
               # Throttle updates to avoid FloodWait
               current_time = time.time()
@@ -131,6 +148,7 @@ Do not include any prefixes. Just provide the raw text of the response.
                 except Exception:
                   # Ignore edit errors (like same text)
                   pass
+          await producer_task
         finally:
           if not spinner_task.done():
             spinner_task.cancel()
