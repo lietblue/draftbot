@@ -72,10 +72,12 @@ async def main():
         "cross-entropy contemplating",
       ]
       i = 0
+      current_msg = random.choice(loading_msgs)
       try:
         while True:
-          msg = random.choice(loading_msgs)
-          await event.edit(f"{frames[i]} {msg}...")
+          if i == 0:
+            current_msg = random.choice(loading_msgs)
+          await event.edit(f"{frames[i]} {current_msg}...")
           i = (i + 1) % len(frames)
           await asyncio.sleep(0.1)
       except asyncio.CancelledError:
