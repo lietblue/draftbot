@@ -21,12 +21,55 @@ SESSION_NAME = 'think_bot_session'
 # Default to a capable model, but allow override
 LLM_MODEL = os.getenv('LLM_MODEL', 'gpt-4o')
 
+# Proxy Configuration
+PROXY_TYPE = os.getenv('PROXY_TYPE')
+PROXY_ADDR = os.getenv('PROXY_ADDR')
+PROXY_PORT = os.getenv('PROXY_PORT')
+PROXY_RDNS = os.getenv('PROXY_RDNS', 'True').lower() == 'true'
+PROXY_USER = os.getenv('PROXY_USER')
+PROXY_PASS = os.getenv('PROXY_PASS')
+
+proxy = None
+proxy_url = None
+
+if PROXY_TYPE and PROXY_ADDR and PROXY_PORT:
+    # Construct proxy URL for litellm/httpx
+    # e.g., socks5://user:pass@host:port
+    auth = ""
+    if PROXY_USER and PROXY_PASS:
+        auth = f"{PROXY_USER}:{PROXY_PASS}@"
+    
+    proxy_url = f"{PROXY_TYPE}://{auth}{PROXY_ADDR}:{PROXY_PORT}"
+    
+    # Set environment variables for litellm (httpx) to use the proxy
+    os.environ['HTTP_PROXY'] = proxy_url
+    os.environ['HTTPS_PROXY'] = proxy_url
+    os.environ['ALL_PROXY'] = proxy_url
+    print(f"Set AI Proxy: {proxy_url}")
+
+    import socks
+    proxy_type_map = {
+        'socks5': socks.SOCKS5,
+        'socks4': socks.SOCKS4,
+        'http': socks.HTTP,
+    }
+    ptype = proxy_type_map.get(PROXY_TYPE.lower())
+    if ptype:
+        proxy = (ptype, PROXY_ADDR, int(PROXY_PORT), PROXY_RDNS, PROXY_USER, PROXY_PASS)
+        print(f"Using Telegram Proxy: {PROXY_TYPE}://{PROXY_ADDR}:{PROXY_PORT}")
+
+# Ensure DEEPSEEK_API_KEY is set if using DeepSeek model
+if 'deepseek' in LLM_MODEL.lower() and not os.getenv('DEEPSEEK_API_KEY'):
+    if os.getenv('OPENAI_API_KEY'):
+        os.environ['DEEPSEEK_API_KEY'] = os.getenv('OPENAI_API_KEY')
+        # print("Mapped OPENAI_API_KEY to DEEPSEEK_API_KEY for compatibility.")
+
 if not API_ID or not API_HASH:
   print("Error: TELEGRAM_API_ID and TELEGRAM_API_HASH must be set in a .env file.")
   exit(1)
 
 async def main():
-  async with TelegramClient(SESSION_NAME, int(API_ID), API_HASH) as client:
+  async with TelegramClient(SESSION_NAME, int(API_ID), API_HASH, proxy=proxy) as client:
     print(f"ThinkBot Connected! Using model: {LLM_MODEL}")
     print("Listening for command: >")
 

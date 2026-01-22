@@ -20,6 +20,27 @@ API_ID = os.getenv('TELEGRAM_API_ID')
 API_HASH = os.getenv('TELEGRAM_API_HASH')
 SESSION_NAME = 'draft_bot_session'
 
+# Proxy Configuration
+PROXY_TYPE = os.getenv('PROXY_TYPE')
+PROXY_ADDR = os.getenv('PROXY_ADDR')
+PROXY_PORT = os.getenv('PROXY_PORT')
+PROXY_RDNS = os.getenv('PROXY_RDNS', 'True').lower() == 'true'
+PROXY_USER = os.getenv('PROXY_USER')
+PROXY_PASS = os.getenv('PROXY_PASS')
+
+proxy = None
+if PROXY_TYPE and PROXY_ADDR and PROXY_PORT:
+    import socks
+    proxy_type_map = {
+        'socks5': socks.SOCKS5,
+        'socks4': socks.SOCKS4,
+        'http': socks.HTTP,
+    }
+    ptype = proxy_type_map.get(PROXY_TYPE.lower())
+    if ptype:
+        proxy = (ptype, PROXY_ADDR, int(PROXY_PORT), PROXY_RDNS, PROXY_USER, PROXY_PASS)
+        print(f"Using Proxy: {PROXY_TYPE}://{PROXY_ADDR}:{PROXY_PORT}")
+
 # Configuration
 MARKER = "\n<<<"
 AUTOSQUASH_ENABLED = False
@@ -136,7 +157,7 @@ async def main():
 
     args = parse_arguments()
 
-    async with TelegramClient(SESSION_NAME, int(API_ID), API_HASH) as client:
+    async with TelegramClient(SESSION_NAME, int(API_ID), API_HASH, proxy=proxy) as client:
         print(f"Connected! (Dry Run: {args.dry_run})")
         print(f"Message backup: {DB_NAME}")
         print("Listening for commands...")
