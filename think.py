@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import time
+import random
 from telethon import TelegramClient, events
 from dotenv import load_dotenv
 import litellm
@@ -30,11 +31,51 @@ async def main():
     print("Listening for command: >")
 
     async def run_spinner(event):
-      frames = ["|", "/", "-", "\\"]
+      frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+      loading_msgs = [
+        "summoning ideas",
+        "tickling neurons",
+        "brewing brainjuice",
+        "petting the thought-cat",
+        "untangling yarn",
+        "chasing laser pointers",
+        "consulting the oracle",
+        "shaking magic 8-ball",
+        "asking the rubber duck",
+        "caffeinating neurons",
+        "defragmenting thoughts",
+        "reticulating splines",
+        "polishing brain cells",
+        "warming up hamsters",
+        "charging flux capacitor",
+        "consulting ancient scrolls",
+        "bribing the muse",
+        "herding thoughts",
+        "juggling concepts",
+        "asking ChatGPT to ask ChatGPT",
+        "hallucinating responsibly",
+        "tokenizing your patience",
+        "attention is all I need",
+        "gradient descending",
+        "overfitting to your question",
+        "escaping local minima",
+        "adjusting hyperparameters",
+        "pruning neural pathways",
+        "backpropagating vibes",
+        "embedding your thoughts",
+        "transformer transforming",
+        "fine-tuning the vibes",
+        "sampling from latent space",
+        "normalizing the batch",
+        "dropout for focus",
+        "softmaxing options",
+        "cross-entropy contemplating",
+      ]
       i = 0
       try:
         while True:
-          await event.edit(frames[i])
+          msg = random.choice(loading_msgs)
+          await event.edit(f"{frames[i]} {msg}...")
           i = (i + 1) % len(frames)
           await asyncio.sleep(0.1)
       except asyncio.CancelledError:
